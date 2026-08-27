@@ -104,13 +104,23 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends $need
           fi
-          if ! command -v disk-image-create >/dev/null; then
-            # --break-system-packages exists from pip 23.0 (PEP 668) and is
-            # rejected by older pip, so it cannot simply be passed always.
-            sudo pip3 install --break-system-packages -r requirements.txt \
-              || sudo pip3 install -r requirements.txt
+          # A virtualenv, not the system python. requirements.txt pulls a newer
+          # typing-extensions than the distro ships, and pip cannot replace a
+          # dpkg-installed package -- it stops at "Cannot uninstall
+          # typing_extensions 4.10.0, RECORD file not found", which is not a
+          # problem with this repository and not one --break-system-packages
+          # can talk its way out of.
+          VENV="$RUNNER_TEMP/dib-venv"
+          if [ ! -x "$VENV/bin/disk-image-create" ]; then
+            sudo apt-get install -y --no-install-recommends python3-venv
+            python3 -m venv "$VENV"
+            "$VENV/bin/pip" install --upgrade pip
+            "$VENV/bin/pip" install -r requirements.txt
           fi
-          disk-image-create --version
+          # diskimage-create.sh calls disk-image-create off PATH, and the later
+          # steps run in their own shells.
+          echo "$VENV/bin" >> "$GITHUB_PATH"
+          "$VENV/bin/disk-image-create" --version
 
       - name: Build the image
         # The body is playbooks/build.yml's script. The element list and the
