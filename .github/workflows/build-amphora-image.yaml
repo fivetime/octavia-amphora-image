@@ -120,9 +120,27 @@ jobs:
           VERSION: ${{ matrix.release }}
         run: |
           set -eux
+          # Distro and element list read out of playbooks/build.yml rather than
+          # repeated here. They were repeated once, and the base moved from
+          # jammy to noble upstream while this copy still said jammy -- an
+          # image that builds cleanly and is not the one anybody asked for.
+          DISTRIBUTION_RELEASE=$(sed -n 's/^ *DISTRIBUTION_RELEASE=\(.*\)$/\1/p' \
+              playbooks/build.yml | head -1)
+          DISTRIBUTION=$(sed -n 's/^ *DISTRIBUTION=\(.*\)$/\1/p' \
+              playbooks/build.yml | head -1)
+          ELEMENTS=$(sed -n 's/^ *export DIB_LOCAL_ELEMENTS="\(.*\)"$/\1/p' \
+              playbooks/build.yml | head -1)
+          test -n "$DISTRIBUTION_RELEASE" -a -n "$DISTRIBUTION" -a -n "$ELEMENTS"
+          echo "distro=$DISTRIBUTION/$DISTRIBUTION_RELEASE elements=$ELEMENTS"
+          # Carried to the manifest step so it records what was actually built.
+          {
+            echo "AMP_DISTRO=$DISTRIBUTION $DISTRIBUTION_RELEASE"
+            echo "AMP_ELEMENTS=$ELEMENTS"
+          } >> "$GITHUB_ENV"
+
           export CLOUD_INIT_DATASOURCES="ConfigDrive, OpenStack"
           export DIB_CLOUD_INIT_DATASOURCES="ConfigDrive, OpenStack"
-          export DIB_LOCAL_ELEMENTS="haproxy-logrotate amphora-dhcpv6-without-ra"
+          export DIB_LOCAL_ELEMENTS="$ELEMENTS"
           export DIB_LOCAL_ELEMENTS_PATH="$PWD/elements/"
 
           rm -rf octavia
@@ -131,8 +149,8 @@ jobs:
 
           cd octavia/diskimage-create
           bash diskimage-create.sh \
-              -a amd64 -b haproxy -d jammy \
-              -g "stable/$VERSION" -i ubuntu-minimal -m \
+              -a amd64 -b haproxy -d "$DISTRIBUTION_RELEASE" \
+              -g "stable/$VERSION" -i "$DISTRIBUTION" -m \
               -o "octavia-amphora-haproxy-$VERSION.qcow2" \
               -s 2 -t qcow2
 
@@ -184,11 +202,11 @@ jobs:
           print(json.dumps({
               'image': img,
               'openstack_release': os.environ['VERSION'],
-              'base': 'ubuntu-minimal jammy',
+              'base': os.environ['AMP_DISTRO'],
               'backend': 'haproxy',
               'octavia_commit': rev('..'),
               'image_repo_commit': rev('../..'),
-              'local_elements': ['haproxy-logrotate', 'amphora-dhcpv6-without-ra'],
+              'local_elements': os.environ['AMP_ELEMENTS'].split(),
               'size_bytes': os.path.getsize(img),
               'sha256': open(img + '.CHECKSUM').read().split()[0],
               'glance': {'disk_format': 'qcow2',
