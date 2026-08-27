@@ -3,12 +3,16 @@
 set -eu
 set -o pipefail
 
-mv /tmp/dhcpv6-without-ra.sh /usr/local/sbin/dhcpv6-without-ra
+mv /tmp/dhcpv6-without-ra.py /usr/local/sbin/dhcpv6-without-ra
 chown root:root /usr/local/sbin/dhcpv6-without-ra
 chmod 0755 /usr/local/sbin/dhcpv6-without-ra
 
 mv /tmp/dhcpv6-without-ra.service /lib/systemd/system/dhcpv6-without-ra.service
 chown root:root /lib/systemd/system/dhcpv6-without-ra.service
 chmod 0644 /lib/systemd/system/dhcpv6-without-ra.service
+
+# The script is python3; the image has it because cloud-init does. Fail the
+# build here rather than at first boot if that ever stops being true.
+test -x /usr/bin/python3
 
 systemctl enable dhcpv6-without-ra.service

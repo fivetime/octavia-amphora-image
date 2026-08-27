@@ -82,6 +82,15 @@ jobs:
           done
           [ "$bad" = 0 ] && echo "all element hooks are executable"
 
+      - name: Unit tests
+        # The element's address arithmetic decides which prefix gets installed
+        # on which interface. Getting it wrong produces an image that boots
+        # cleanly and is unreachable, which costs a full build plus a testbed
+        # round trip to notice. Seconds here instead.
+        run: |
+          set -eu
+          python3 -m unittest discover -s tests -v
+
       - name: Can this runner build a disk image at all
         # diskimage-builder partitions a file over a loop device and chroots
         # into a tree it builds from scratch. A runner that cannot do that
@@ -206,6 +215,15 @@ jobs:
           sudo test -x "$M/usr/local/sbin/dhcpv6-without-ra"
           sudo test -f "$M/lib/systemd/system/dhcpv6-without-ra.service"
           sudo grep -q 'WithoutRA=solicit' "$M/usr/local/sbin/dhcpv6-without-ra"
+          # The on-link route half. Soliciting DHCPv6 without it yields an
+          # instance that holds its address and answers nothing off-link --
+          # the exact failure this element exists to prevent, and one that
+          # looks identical from the controller to having no address at all.
+          sudo grep -q 'Destination=' "$M/usr/local/sbin/dhcpv6-without-ra"
+          sudo grep -q 'Scope=link' "$M/usr/local/sbin/dhcpv6-without-ra"
+          # The script is python3 now; the interpreter has to be in the image.
+          sudo head -1 "$M/usr/local/sbin/dhcpv6-without-ra" | grep -q 'python3'
+          sudo test -x "$M/usr/bin/python3"
           # Enabled, not merely present: an installed-but-not-enabled unit
           # leaves the image looking right and behaving exactly as before.
           sudo test -L "$M/etc/systemd/system/network-online.target.wants/dhcpv6-without-ra.service"
