@@ -62,6 +62,26 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
+      - name: Element hooks must be executable
+        # diskimage-builder copies every hook it finds but runs only the
+        # executable ones, and says nothing about the others. A hook committed
+        # 100644 therefore produces a build that succeeds and an image with
+        # none of the element in it -- forty-five minutes to find out. Windows
+        # checkouts default to core.filemode=false, which is how one gets
+        # committed that way.
+        run: |
+          set -eu
+          bad=0
+          for h in elements/*/*.d/*; do
+            [ -f "$h" ] || continue
+            if [ ! -x "$h" ]; then
+              echo "::error file=$h::hook is not executable; diskimage-builder" \
+                   "will skip it silently. Fix with: git update-index --chmod=+x $h"
+              bad=1
+            fi
+          done
+          [ "$bad" = 0 ] && echo "all element hooks are executable"
+
       - name: Can this runner build a disk image at all
         # diskimage-builder partitions a file over a loop device and chroots
         # into a tree it builds from scratch. A runner that cannot do that
