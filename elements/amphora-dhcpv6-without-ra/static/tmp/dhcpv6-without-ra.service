@@ -1,0 +1,14 @@
+[Unit]
+Description=Solicit DHCPv6 without a router advertisement
+Documentation=file:///usr/share/doc/amphora-dhcpv6-without-ra
+After=systemd-networkd.service
+Before=systemd-networkd-wait-online.service
+Wants=systemd-networkd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/dhcpv6-without-ra
+
+[Install]
+WantedBy=network-online.target

@@ -1,0 +1,241 @@
+name: Build amphora image
+
+# Builds the Octavia amphora image with diskimage-builder, the same way
+# playbooks/build.yml does under Zuul, and publishes it as a GitHub release.
+#
+# The matrix axis is the OpenStack release, not the distribution: the amphora
+# image tracks Octavia's stable branches and one image serves each. It starts
+# narrow on purpose -- give `releases` a comma-separated list to widen it.
+#
+# Runs on self-hosted runners, which are ephemeral: one fresh machine per job.
+# Everything a job needs it installs itself, and nothing carries over from the
+# job before it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      releases:
+        description: 'OpenStack releases to build (comma-separated)'
+        type: string
+        default: '2026.1'
+      publish_release:
+        description: 'Publish a GitHub release with the image'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-amphora-image
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: self-hosted
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - name: Generate the release matrix
+        id: gen
+        env:
+          RELEASES: ${{ inputs.releases }}
+        run: |
+          set -eu
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          rels = [r.strip() for r in (os.environ.get('RELEASES') or '2026.1').split(',') if r.strip()]
+          assert rels, 'no releases requested'
+          print('matrix=' + json.dumps({'release': rels}))
+          PY
+          cat "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    runs-on: self-hosted
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Can this runner build a disk image at all
+        # diskimage-builder partitions a file over a loop device and chroots
+        # into a tree it builds from scratch. A runner that cannot do that
+        # fails deep inside the build, half an hour in, with a message about a
+        # package or a mount. Prove it here, where the error can name the
+        # missing capability instead.
+        run: |
+          set -eux
+          sudo -n true || { echo "::error::no passwordless sudo; diskimage-builder needs root"; exit 1; }
+
+          sudo modprobe loop || true
+          test -e /dev/loop-control || {
+            echo "::error::no /dev/loop-control: this runner cannot attach loop" \
+                 "devices, which diskimage-builder needs. A container runtime" \
+                 "normally has to be privileged for this."
+            exit 1; }
+
+          IMG=$(mktemp); truncate -s 64M "$IMG"
+          LOOP=$(sudo losetup --find --show "$IMG") || {
+            echo "::error::losetup failed; loop devices are unusable here"
+            rm -f "$IMG"; exit 1; }
+          sudo losetup -d "$LOOP"; rm -f "$IMG"
+
+          AVAIL=$(df -BG --output=avail . | tail -1 | tr -dc '0-9')
+          echo "available disk: ${AVAIL}G"
+          [ "${AVAIL:-0}" -ge 12 ] || {
+            echo "::error::only ${AVAIL}G free; the build needs roughly 10G"
+            exit 1; }
+
+      - name: Install build dependencies
+        # Mirrors playbooks/pre.yml. Conditional because apt is the slowest
+        # thing here and a warm runner may already have them.
+        run: |
+          set -eux
+          need=""
+          for p in kpartx qemu-utils squashfs-tools debootstrap; do
+            dpkg -s "$p" >/dev/null 2>&1 || need="$need $p"
+          done
+          if [ -n "$need" ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends $need
+          fi
+          if ! command -v disk-image-create >/dev/null; then
+            # --break-system-packages exists from pip 23.0 (PEP 668) and is
+            # rejected by older pip, so it cannot simply be passed always.
+            sudo pip3 install --break-system-packages -r requirements.txt \
+              || sudo pip3 install -r requirements.txt
+          fi
+          disk-image-create --version
+
+      - name: Build the image
+        # The body is playbooks/build.yml's script. The element list and the
+        # disk-image-create arguments are the part that matters; keep them
+        # identical to the playbook so the two cannot drift apart quietly.
+        env:
+          VERSION: ${{ matrix.release }}
+        run: |
+          set -eux
+          export CLOUD_INIT_DATASOURCES="ConfigDrive, OpenStack"
+          export DIB_CLOUD_INIT_DATASOURCES="ConfigDrive, OpenStack"
+          export DIB_LOCAL_ELEMENTS="haproxy-logrotate amphora-dhcpv6-without-ra"
+          export DIB_LOCAL_ELEMENTS_PATH="$PWD/elements/"
+
+          rm -rf octavia
+          git clone --depth 1 -b "stable/$VERSION" \
+              https://opendev.org/openstack/octavia octavia
+
+          cd octavia/diskimage-create
+          bash diskimage-create.sh \
+              -a amd64 -b haproxy -d jammy \
+              -g "stable/$VERSION" -i ubuntu-minimal -m \
+              -o "octavia-amphora-haproxy-$VERSION.qcow2" \
+              -s 2 -t qcow2
+
+          qemu-img info "octavia-amphora-haproxy-$VERSION.qcow2"
+
+      - name: Verify the element landed in the image
+        # A build that succeeds says the element ran, not that its files are in
+        # the image. Reading them back out is what says that -- and getting
+        # them in is the entire reason this image is being rebuilt.
+        env:
+          VERSION: ${{ matrix.release }}
+        run: |
+          set -eux
+          cd octavia/diskimage-create
+          sudo modprobe nbd max_part=8
+          sudo qemu-nbd --disconnect /dev/nbd0 >/dev/null 2>&1 || true
+          sudo qemu-nbd --read-only --connect=/dev/nbd0 \
+            "octavia-amphora-haproxy-$VERSION.qcow2"
+          sleep 3
+          M=$(mktemp -d)
+          sudo mount -o ro,noload /dev/nbd0p1 "$M" || sudo mount -o ro /dev/nbd0p1 "$M"
+
+          sudo test -x "$M/usr/local/sbin/dhcpv6-without-ra"
+          sudo test -f "$M/lib/systemd/system/dhcpv6-without-ra.service"
+          sudo grep -q 'WithoutRA=solicit' "$M/usr/local/sbin/dhcpv6-without-ra"
+          # Enabled, not merely present: an installed-but-not-enabled unit
+          # leaves the image looking right and behaving exactly as before.
+          sudo test -L "$M/etc/systemd/system/network-online.target.wants/dhcpv6-without-ra.service"
+          echo "element verified inside the image"
+
+          sudo umount "$M"; sudo qemu-nbd --disconnect /dev/nbd0
+
+      - name: Checksum and manifest
+        env:
+          VERSION: ${{ matrix.release }}
+        run: |
+          set -eux
+          cd octavia/diskimage-create
+          IMG="octavia-amphora-haproxy-$VERSION.qcow2"
+          sha256sum "$IMG" > "$IMG.CHECKSUM"
+          BUILT="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          IMG="$IMG" VERSION="$VERSION" BUILT="$BUILT" python3 - <<'PY' \
+            > "octavia-amphora-haproxy-$VERSION.manifest.json"
+          import json, os, subprocess
+          img = os.environ['IMG']
+          def rev(path):
+              return subprocess.check_output(
+                  ['git', '-C', path, 'rev-parse', 'HEAD']).decode().strip()
+          print(json.dumps({
+              'image': img,
+              'openstack_release': os.environ['VERSION'],
+              'base': 'ubuntu-minimal jammy',
+              'backend': 'haproxy',
+              'octavia_commit': rev('..'),
+              'image_repo_commit': rev('../..'),
+              'local_elements': ['haproxy-logrotate', 'amphora-dhcpv6-without-ra'],
+              'size_bytes': os.path.getsize(img),
+              'sha256': open(img + '.CHECKSUM').read().split()[0],
+              'glance': {'disk_format': 'qcow2',
+                         'container_format': 'bare',
+                         'tag': 'amphora'},
+              'built_by': os.environ['BUILT'],
+          }, indent=2))
+          PY
+          cat "octavia-amphora-haproxy-$VERSION.manifest.json"
+
+      - name: Publish release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ matrix.release }}
+        run: |
+          set -eux
+          cd octavia/diskimage-create
+          # Notes written to a file by python rather than built in the shell:
+          # the body carries backticks and a fenced block, and quoting those
+          # through a shell substitution is a good way to publish a mangled
+          # release page.
+          VERSION="$VERSION" python3 - <<'PY' > notes.md
+          import json, os
+          v = os.environ['VERSION']
+          m = json.load(open('octavia-amphora-haproxy-%s.manifest.json' % v))
+          print('Amphora image for OpenStack %s' % v)
+          print()
+          print('| | |')
+          print('|---|---|')
+          print('| octavia | `%s` |' % m['octavia_commit'])
+          print('| base | %s |' % m['base'])
+          print('| elements | %s |' % ', '.join(m['local_elements']))
+          print('| sha256 | `%s` |' % m['sha256'])
+          print()
+          print('Put into service with:')
+          print()
+          print('```')
+          print('openstack image create amphora-x64-haproxy \\')
+          print('  --disk-format qcow2 --container-format bare --tag amphora \\')
+          print('  --file octavia-amphora-haproxy-%s.qcow2' % v)
+          print('```')
+          PY
+          TAG="amphora-$VERSION-$(date -u +%Y%m%d)-$GITHUB_RUN_NUMBER"
+          gh release create "$TAG" --title "Amphora image $TAG" \
+            --notes-file notes.md \
+            "octavia-amphora-haproxy-$VERSION.qcow2" \
+            "octavia-amphora-haproxy-$VERSION.qcow2.CHECKSUM" \
+            "octavia-amphora-haproxy-$VERSION.manifest.json"

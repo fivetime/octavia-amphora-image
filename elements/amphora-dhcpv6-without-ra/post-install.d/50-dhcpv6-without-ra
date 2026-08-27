@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+set -eu
+set -o pipefail
+
+mv /tmp/dhcpv6-without-ra.sh /usr/local/sbin/dhcpv6-without-ra
+chown root:root /usr/local/sbin/dhcpv6-without-ra
+chmod 0755 /usr/local/sbin/dhcpv6-without-ra
+
+mv /tmp/dhcpv6-without-ra.service /lib/systemd/system/dhcpv6-without-ra.service
+chown root:root /lib/systemd/system/dhcpv6-without-ra.service
+chmod 0644 /lib/systemd/system/dhcpv6-without-ra.service
+
+systemctl enable dhcpv6-without-ra.service
